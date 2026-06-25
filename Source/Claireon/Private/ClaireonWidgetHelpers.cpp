@@ -367,7 +367,7 @@ UPanelSlot* ClaireonWidgetHelpers::AddChildToPanel(UPanelWidget* Parent, UWidget
 			}
 			FString PropStrVal = Pair.Value.IsValid() ? Pair.Value->AsString() : TEXT("");
 			FString Error;
-			WriteSlotProperty(Slot, Pair.Key, PropStrVal, Error);
+			WriteSlotProperty(Slot, *Pair.Key, PropStrVal, Error);
 		}
 	}
 
