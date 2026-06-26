@@ -85,6 +85,7 @@ public class Claireon : ModuleRules
 
 			// REPL widget dependencies
 			"HTTP",              // FHttpModule for REPL outbound API calls
+			"Sockets",           // raw-socket background heartbeat (thread-independent of the game-thread HTTP manager)
 			"Settings",          // ISettingsModule for settings gear deep-link
 			"DeveloperSettings", // UDeveloperSettings base class for UClaireonSettings
 			"ContentBrowser",    // Rich text asset path navigation

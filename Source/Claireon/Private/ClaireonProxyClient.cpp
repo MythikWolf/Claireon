@@ -16,6 +16,12 @@
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Interfaces/IPluginManager.h"
+#include "Sockets.h"
+#include "SocketSubsystem.h"
+#include "IPAddress.h"
+#include "HAL/Runnable.h"
+#include "HAL/RunnableThread.h"
+#include <atomic>
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
 #include "Misc/SecureHash.h"
@@ -149,6 +155,127 @@ namespace
 		FJsonSerializer::Deserialize(Reader, Out);
 		return Out;
 	}
+
+	/**
+	 * Compose a complete HTTP/1.1 POST (headers + JSON body) for a localhost
+	 * endpoint. Used by the background heartbeat, which CANNOT use FHttpModule:
+	 * SyncHttp above drives completion via GetHttpManager().Tick() on the game
+	 * thread -- the very thread a long synchronous load (map/cook) blocks. A raw
+	 * socket send is thread-independent, so the heartbeat survives those stalls
+	 * and the proxy never evicts the session for staleness mid-load.
+	 */
+	FString MakeRawHttpPost(const TCHAR* Path, const FString& JsonBody)
+	{
+		const FTCHARToUTF8 Utf8Body(*JsonBody);
+		return FString::Printf(
+			TEXT("POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\n")
+			TEXT("Content-Length: %d\r\nConnection: close\r\n\r\n%s"),
+			Path, ClaireonProxy::LoopbackHost, ClaireonProxy::PROXY_REG_PORT,
+			Utf8Body.Length(), *JsonBody);
+	}
+
+	/**
+	 * Blocking raw-socket POST to 127.0.0.1:PROXY_REG_PORT. Returns true if the
+	 * full request was sent. Drains the reply best-effort (ignored) so the proxy
+	 * completes the request without a RST. Safe on any thread -- no FHttpModule
+	 * or game-thread HTTP-manager dependency.
+	 */
+	bool RawSocketPostLoopback(const FString& RequestBytes)
+	{
+		ISocketSubsystem* SocketSub = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+		if (!SocketSub)
+		{
+			return false;
+		}
+		TSharedRef<FInternetAddr> Addr = SocketSub->CreateInternetAddr();
+		bool bValidIp = false;
+		Addr->SetIp(ClaireonProxy::LoopbackHost, bValidIp);
+		Addr->SetPort(ClaireonProxy::PROXY_REG_PORT);
+		if (!bValidIp)
+		{
+			return false;
+		}
+
+		FSocket* Socket = SocketSub->CreateSocket(NAME_Stream, TEXT("ClaireonBgHeartbeat"), Addr->GetProtocolType());
+		if (!Socket)
+		{
+			return false;
+		}
+		Socket->SetNonBlocking(false);
+
+		bool bSentAll = false;
+		if (Socket->Connect(*Addr))
+		{
+			const FTCHARToUTF8 Utf8(*RequestBytes);
+			const uint8* Data = reinterpret_cast<const uint8*>(Utf8.Get());
+			const int32 Total = Utf8.Length();
+			int32 Sent = 0;
+			while (Sent < Total)
+			{
+				int32 Chunk = 0;
+				if (!Socket->Send(Data + Sent, Total - Sent, Chunk) || Chunk <= 0)
+				{
+					break;
+				}
+				Sent += Chunk;
+			}
+			bSentAll = (Sent == Total);
+
+			// Best-effort drain so the proxy's handler completes cleanly.
+			if (Socket->Wait(ESocketWaitConditions::WaitForRead, FTimespan::FromMilliseconds(500)))
+			{
+				uint8 DrainBuf[512];
+				int32 Read = 0;
+				Socket->Recv(DrainBuf, sizeof(DrainBuf), Read);
+			}
+		}
+
+		Socket->Close();
+		SocketSub->DestroySocket(Socket);
+		return bSentAll;
+	}
+
+	/**
+	 * Background heartbeat loop. Sends the cached /editor/heartbeat request over a
+	 * raw socket on its own thread so a blocked game thread can't starve it (the
+	 * root cause of proxy staleness eviction during heavy loads). State-machine
+	 * transitions stay on the game-thread FTSTicker; this thread only keeps the
+	 * session alive while registered.
+	 */
+	class FClaireonHeartbeatRunnable : public FRunnable
+	{
+	public:
+		FClaireonHeartbeatRunnable(const FClaireonProxyClient* InOwner, FString InRequest)
+			: Owner(InOwner)
+			, Request(MoveTemp(InRequest))
+		{
+		}
+
+		virtual uint32 Run() override
+		{
+			while (!bStop.load())
+			{
+				if (Owner && Owner->IsRegistered())
+				{
+					RawSocketPostLoopback(Request);
+				}
+				// Sleep the heartbeat interval in small slices so Stop() is prompt.
+				const int32 Slices = ClaireonProxy::HEARTBEAT_INTERVAL_SECONDS * 10;
+				for (int32 i = 0; i < Slices && !bStop.load(); ++i)
+				{
+					FPlatformProcess::Sleep(0.1f);
+				}
+			}
+			return 0;
+		}
+
+		virtual void Stop() override { bStop.store(true); }
+
+	private:
+		const FClaireonProxyClient* Owner;
+		const FString Request;
+		std::atomic<bool> bStop{false};
+	};
 } // namespace
 
 FClaireonProxyClient::FClaireonProxyClient()
@@ -157,6 +284,9 @@ FClaireonProxyClient::FClaireonProxyClient()
 
 FClaireonProxyClient::~FClaireonProxyClient()
 {
+	// Join the background thread first so its Run() can't touch a half-destroyed
+	// owner (it calls IsRegistered()).
+	StopBackgroundHeartbeat();
 	StopHeartbeatTicker();
 }
 
@@ -822,6 +952,7 @@ void FClaireonProxyClient::ScheduleRetry(double NowSeconds)
 void FClaireonProxyClient::Unregister()
 {
 	StopHeartbeatTicker();
+	StopBackgroundHeartbeat();
 
 	if (!bIsRegistered)
 	{
@@ -864,6 +995,9 @@ void FClaireonProxyClient::StartHeartbeatTicker()
 	HeartbeatTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
 		FTickerDelegate::CreateRaw(this, &FClaireonProxyClient::HeartbeatTick),
 		static_cast<float>(ClaireonProxy::HEARTBEAT_INTERVAL_SECONDS));
+	// Also run a game-thread-independent heartbeat so heavy synchronous loads
+	// (map open / cook) can't starve the ping and trip staleness eviction.
+	EnsureBackgroundHeartbeat();
 }
 
 void FClaireonProxyClient::StopHeartbeatTicker()
@@ -873,6 +1007,45 @@ void FClaireonProxyClient::StopHeartbeatTicker()
 		FTSTicker::GetCoreTicker().RemoveTicker(HeartbeatTickerHandle);
 		HeartbeatTickerHandle.Reset();
 	}
+}
+
+void FClaireonProxyClient::EnsureBackgroundHeartbeat()
+{
+	if (BackgroundHeartbeatThread.IsValid())
+	{
+		return; // already running -- the session identity never changes mid-process
+	}
+
+	// Build the heartbeat request once from this session's immutable identity
+	// (worktree_root, pid, start_time_ns -- the same tuple register sent, so the
+	// proxy matches it). StartTimeNs is latched before any StartHeartbeatTicker.
+	const FString WorktreeRoot = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("worktree_root"), WorktreeRoot);
+	Payload->SetNumberField(TEXT("pid"), FPlatformProcess::GetCurrentProcessId());
+	Payload->SetStringField(TEXT("start_time_ns"), FString::Printf(TEXT("%lld"), StartTimeNs));
+
+	FString JsonBody;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonBody);
+	FJsonSerializer::Serialize(Payload, Writer);
+	const FString Request = MakeRawHttpPost(ClaireonProxy::HeartbeatEndpoint, JsonBody);
+
+	BackgroundHeartbeatRunnable = MakeUnique<FClaireonHeartbeatRunnable>(this, Request);
+	BackgroundHeartbeatThread.Reset(FRunnableThread::Create(
+		BackgroundHeartbeatRunnable.Get(), TEXT("ClaireonBgHeartbeat"), 0, TPri_BelowNormal));
+
+	UE_LOG(LogClaireon, Display,
+		TEXT("[MCP Proxy] Background heartbeat thread started (survives game-thread stalls during heavy loads)."));
+}
+
+void FClaireonProxyClient::StopBackgroundHeartbeat()
+{
+	if (BackgroundHeartbeatThread.IsValid())
+	{
+		BackgroundHeartbeatThread->Kill(true); // Stop() + join Run()
+		BackgroundHeartbeatThread.Reset();
+	}
+	BackgroundHeartbeatRunnable.Reset();
 }
 
 FHeartbeatResult FClaireonProxyClient::SendHeartbeat()
