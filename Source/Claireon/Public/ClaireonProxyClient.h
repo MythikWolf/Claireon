@@ -7,6 +7,11 @@
 #include "Containers/Ticker.h"
 #include "HAL/PlatformProcess.h"
 
+#include <atomic>
+
+class FRunnable;
+class FRunnableThread;
+
 /**
  * Proxy registration lifecycle state. Driven by the heartbeat ticker after
  * StartServer hands the client to RetryRegister; transitions are documented
@@ -381,6 +386,16 @@ private:
 	bool HeartbeatTick(float DeltaTime);
 
 	/**
+	 * Idempotently start the background socket-heartbeat thread for this session.
+	 * It pings /editor/heartbeat over a raw socket every interval while registered,
+	 * so a blocked game thread (heavy map load / cook) cannot starve the heartbeat
+	 * and trip the proxy's 180s staleness eviction. No-op if already running.
+	 */
+	void EnsureBackgroundHeartbeat();
+	/** Stop + join the background heartbeat thread. */
+	void StopBackgroundHeartbeat();
+
+	/**
 	 * Single attempt at /editor/register. Returns Accepted on {accepted:true},
 	 * TerminalAuthOrMalformed on a 4xx with an "auth"/"malformed_request"-shaped
 	 * reason, Transient otherwise. The version_mismatch respawn path was
@@ -453,8 +468,21 @@ private:
 	/** Heartbeat ticker handle. */
 	FTSTicker::FDelegateHandle HeartbeatTickerHandle;
 
-	/** True between successful Register() and Unregister() / shutdown. */
-	bool bIsRegistered = false;
+	/**
+	 * Background socket-heartbeat thread + runnable. Keeps the proxy session
+	 * alive while the game thread is blocked (heavy map loads / cooks), which the
+	 * FTSTicker-driven heartbeat cannot do. Owned here; torn down in
+	 * StopBackgroundHeartbeat() (destructor / Unregister).
+	 */
+	TUniquePtr<FRunnable> BackgroundHeartbeatRunnable;
+	TUniquePtr<FRunnableThread> BackgroundHeartbeatThread;
+
+	/**
+	 * True between successful Register() and Unregister() / shutdown. Atomic
+	 * because the background heartbeat thread reads it every interval to decide
+	 * whether to ping (see ClaireonProxyClient.cpp).
+	 */
+	std::atomic<bool> bIsRegistered{false};
 
 	/**
 	 * Optional transport overrides for ClaireonRetryRegister.spec.cpp.
