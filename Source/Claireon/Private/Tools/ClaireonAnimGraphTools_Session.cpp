@@ -299,7 +299,11 @@ FToolResult ClaireonAnimGraphTool_Compile::Execute(const TSharedPtr<FJsonObject>
 		return MakeErrorResult(TEXT("AnimBP no longer valid"));
 	}
 
-	FKismetEditorUtilities::CompileBlueprint(AnimBP);
+	// Skip GC during compile. Default CompileBlueprint runs CollectGarbage at the end; invoked from an MCP
+	// tool call on the game thread, that GC pass wedges the editor indefinitely on "Compiling Blueprint"
+	// (~all cores pegged, log frozen). UBlueprintEditorLibrary::CompileBlueprint and ClaireonAnimGraphTool_Save
+	// both pass SkipGarbageCollection for exactly this reason.
+	FKismetEditorUtilities::CompileBlueprint(AnimBP, EBlueprintCompileOptions::SkipGarbageCollection);
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("session_id"), SessionId);
